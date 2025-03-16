@@ -127,14 +127,9 @@ impl Args {
                     map.set_debug_flags(debug.into());
                 }
                 map.set_style_url(&self.style);
-                map.set_camera(
-                    self.x as f64,
-                    self.y as f64,
-                    self.zoom as f64,
-                    self.bearing,
-                    self.pitch,
-                );
-                map.render_static().as_slice().to_vec()
+                map.render_static(self.x, self.y, self.zoom, self.bearing, self.pitch)
+                    .as_slice()
+                    .to_vec()
             }
             Mode::Tile => {
                 if self.bearing != 0.0 || self.pitch != 0.0 {

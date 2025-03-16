@@ -1,6 +1,6 @@
 [package]
 name = "maplibre_native"
-version = "0.1.1"
+version = "0.2.0"
 description = "Rust bindings to the MapLibre Native map rendering engine"
 authors = ["Yuri Astrakhan <YuriAstrakhan@gmail.com>"]
 repository = "https://github.com/nyurik/maplibre-native-rs"
@@ -52,7 +52,7 @@ clap = { version = "4.5.27", features = ["derive", "env", "unstable-markdown"] }
 cmake = "0.1"
 cxx = "1.0.138"
 cxx-build = "1.0.138"
-maplibre_native = { path = ".", version = "0.1.0" }
+maplibre_native = { path = ".", version = "0.2.0" }
 walkdir = "2.5.0"
 
 [workspace.lints.rust]

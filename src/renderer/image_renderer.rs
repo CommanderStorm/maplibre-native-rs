@@ -48,14 +48,9 @@ impl<S> ImageRenderer<S> {
         self
     }
 
-    pub fn set_camera(
-        &mut self,
-        lat: f64,
-        lon: f64,
-        zoom: f64,
-        bearing: f64,
-        pitch: f64,
-    ) -> &mut Self {
+    fn set_camera(&mut self, zoom: u8, x: u32, y: u32, bearing: f64, pitch: f64) -> &mut Self {
+        let zoom = f64::from(zoom);
+        let (lat, lon) = coords_to_lat_lon(zoom, x, y);
         ffi::MapRenderer_setCamera(self.0.pin_mut(), lat, lon, zoom, bearing, pitch);
         self
     }
@@ -67,15 +62,15 @@ impl<S> ImageRenderer<S> {
 }
 
 impl ImageRenderer<Static> {
-    pub fn render_static(&mut self) -> Image {
+    pub fn render_static(&mut self, zoom: u8, x: u32, y: u32, bearing: f64, pitch: f64) -> Image {
+        self.set_camera(x, y, zoom, bearing, pitch);
         Image(ffi::MapRenderer_render(self.0.pin_mut()))
     }
 }
 
 impl ImageRenderer<Tile> {
     pub fn render_tile(&mut self, zoom: u8, x: u32, y: u32) -> Image {
-        let (lat, lon) = coords_to_lat_lon(f64::from(zoom), x, y);
-        ffi::MapRenderer_setCamera(self.0.pin_mut(), lat, lon, f64::from(zoom), 0.0, 0.0);
+        self.set_camera(x, y, zoom, 0.0, 0.0);
         Image(ffi::MapRenderer_render(self.0.pin_mut()))
     }
 }
