@@ -1,9 +1,50 @@
+//! File for defining how we download and link against `MapLibre Native`.
+//! Set `MLN_CORE_LIBRARY_PATH` and `MLN_CORE_LIBRARY_HEADERS_PATH` environment variables to use a local version of maplibre
+//!
+//! If you don't use the AMALGAM library define the env variable `MLN_CORE_LIBRARY_NO_AMALGAM` (value does not matter).
+//! In this case all dependend libraries get linked manually
+//!
+//! IMPORTANT: The library path must point to the amalgan library which contains all the dependent libraries if `MLN_CORE_LIBRARY_NO_AMALGAM` is not set!
+//!
+//! Required libraries:
+//! Fedora:
+//!     - `sudo dnf install libicu-devel libglslang-devel spirv-tools-devel libpng-devel libjpeg-turbo-devel libuv-devel libwebp-devel`
+//! Ubuntu:
+//!     - `sudo apt install glslang-dev glslang-tools libicu-dev libpng-dev libjpeg-turbo8-dev libuv1-dev libwebp-dev libglfw3-dev ccache`
+//!
+//! To build the amalgam library [armerge](https://github.com/tux3/armerge) is required:
+//!     - `cargo install armerge`
+//!     - `sudo apt install llvm` llvm-objcopy required
+
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::{env, fs};
 
 use downloader::{Download, Downloader};
 
-const MLN_REVISION: &str = "core-9b6325a14e2cf1cc29ab28c1855ad376f1ba4903";
+// Used when building locally
+const MLN_COMMIT: &str = "35cf39b72f45cfea55a34ffe7358ade5c950a3c5";
+
+// Files of the bridge
+const BRIDGE_FILES: &[&str] = &[
+    "src/renderer/bridge.rs",
+    "src/cpp/bridge.cpp",
+    "src/cpp/util.cpp",
+    "src/cpp/resource_options.h",
+    "src/cpp/resource_options.cpp",
+    "src/cpp/tile_server_options.h",
+    "src/cpp/tile_server_options.cpp",
+    "src/cpp/map_renderer.h",
+    "src/cpp/renderer_observer.h",
+    "src/cpp/map_observer.h",
+    "src/cpp/rust_log_observer.h",
+    "src/cpp/sources/sources.h",
+    "src/cpp/sources/sources.cpp",
+    "src/cpp/layers/layers.h",
+    "src/cpp/layers/layers.cpp",
+];
+
+const BRIDGE_INCLUDE_DIRS: &[&str] = &["include", "src/cpp"];
 
 /// Supported graphics rendering APIs.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -26,7 +67,8 @@ impl GraphicsRenderingAPI {
         let with_metal = env::var("CARGO_FEATURE_METAL").is_ok();
         let with_vulkan = env::var("CARGO_FEATURE_VULKAN").is_ok();
 
-        let is_macos = cfg!(any(target_os = "ios", target_os = "macos"));
+        let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+        let is_macos = target_os == "ios" || target_os == "macos";
 
         match (with_metal, with_vulkan, with_opengl) {
             (true, false, false) => Self::Metal,
@@ -119,6 +161,36 @@ fn download_static(out_dir: &Path, revision: &str) -> (PathBuf, PathBuf) {
     (library_file, headers_file)
 }
 
+/// Reads `[package.metadata.mln].release` from the crate's `Cargo.toml`.
+fn mln_release_from_manifest() -> String {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"));
+    let manifest_path = manifest_dir.join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+
+    let manifest_str = fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
+        panic!("Failed to read manifest at {}: {err}", manifest_path.display())
+    });
+
+    let manifest: toml::Value = manifest_str.parse().unwrap_or_else(|err| {
+        panic!("Failed to parse manifest as TOML at {}: {err}", manifest_path.display())
+    });
+
+    manifest
+        .get("package")
+        .and_then(|package| package.get("metadata"))
+        .and_then(|metadata| metadata.get("mln"))
+        .and_then(|mln| mln.get("release"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "Missing string key [package.metadata.mln].release in {}",
+                manifest_path.display()
+            )
+        })
+        .to_owned()
+}
+
 /// Extracts the headers from the downloaded tarball
 fn extract_headers(headers_from: &Path, headers_to: &Path) {
     println!(
@@ -134,59 +206,60 @@ fn extract_headers(headers_from: &Path, headers_to: &Path) {
     }
     let mut archive = tar::Archive::new(&mut tar);
     archive.set_overwrite(true);
-    archive
-        .unpack(headers_to)
-        .expect("Failed to extract headers");
+    archive.unpack(headers_to).expect("Failed to extract headers");
 }
 
 /// Get local directory or download maplibre-native into the `OUT_DIR`
 ///
-/// Returns the path to the maplibre-native directory and an optional path to an include directorys.
-fn resolve_mln_core(root: &Path) -> (PathBuf, Vec<PathBuf>) {
+/// Returns the path to the maplibre-native directory and the include directories.
+fn resolve_mln_core() -> (PathBuf, Vec<PathBuf>) {
     let out_dir =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set")).join("maplibre-native");
+    let mln_release = mln_release_from_manifest();
 
     println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_PATH");
     println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_HEADERS_PATH");
     let (library_file, headers) =match (env::var_os("MLN_CORE_LIBRARY_PATH"), env::var_os("MLN_CORE_LIBRARY_HEADERS_PATH")) {
-      (Some(library_path),Some(headers_path)) => (PathBuf::from(library_path), PathBuf::from(headers_path)),
+      (Some(library_path),Some(headers_path)) => {
+        println!("cargo:warning=Local library and headers will be used");
+        let _ = headers_path.clone().into_string().inspect(|s| println!("cargo:rerun-if-changed={s}"));
+        let _ = library_path.clone().into_string().inspect(|s| println!("cargo:rerun-if-changed={s}"));
+        (PathBuf::from(library_path), PathBuf::from(headers_path))
+    },
       (Some(_), None) => panic!("MLN_CORE_LIBRARY_HEADERS_PATH is not set. To compile from a local library/headers, both MLN_CORE_LIBRARY_PATH and MLN_CORE_LIBRARY_HEADERS_PATH must be set."),
       (None, Some(_)) => panic!("MLN_CORE_LIBRARY_PATH is not set. To compile from a local library/headers, both MLN_CORE_LIBRARY_PATH and MLN_CORE_LIBRARY_HEADERS_PATH must be set."),
       // Default => to downloading the static library
-      (None, None) => download_static(&out_dir, MLN_REVISION),
+    (None, None) => download_static(&out_dir, &mln_release),
      };
     assert!(
         library_file.is_file(),
-        "The MLN library at {} must be a file",
+        "The MLN library at {} must be a file. When building locally on Linux it is called libmbgl-core-amalgam.a",
         library_file.display()
     );
-    assert!(
-        headers.is_file(),
-        "The MLN headers at {} must be a zip file containing the headers",
-        headers.display()
-    );
+    if env::var_os("MLN_CORE_LIBRARY_HEADERS_PATH").is_some() {
+        assert!(
+            headers.is_file(),
+            "The MLN headers at {} must be a gzip (tar.gz) file containing the headers. When building locally checkout <maplibre-native repository>/.github/workflows/core-release.yml commands how to create the header archive",
+            headers.display()
+        );
+    } else {
+        assert!(
+            headers.is_file(),
+            "The MLN headers at {} must be a gzip (tar.gz) file containing the headers.",
+            headers.display()
+        );
+    }
 
     let extracted_path = out_dir.join("headers");
     extract_headers(&headers, &extracted_path);
     // Returning the downloaded file, bypassing CMakeLists.txt check
+    let base = extracted_path.join("vendor").join("maplibre-native-base");
+    let deps = base.join("deps");
     let include_dirs = vec![
-        root.join("include"),
-        extracted_path
-            .join("vendor")
-            .join("maplibre-native-base")
-            .join("include"),
-        extracted_path
-            .join("vendor")
-            .join("maplibre-native-base")
-            .join("deps")
-            .join("geometry.hpp")
-            .join("include"),
-        extracted_path
-            .join("vendor")
-            .join("maplibre-native-base")
-            .join("deps")
-            .join("variant")
-            .join("include"),
+        base.join("include"),
+        deps.join("geometry.hpp").join("include"),
+        deps.join("geojson.hpp").join("include"),
+        deps.join("variant").join("include"),
         extracted_path.join("include"),
     ];
     (library_file, include_dirs)
@@ -194,33 +267,185 @@ fn resolve_mln_core(root: &Path) -> (PathBuf, Vec<PathBuf>) {
 
 /// Gather include directories and build the C++ bridge using `cxx_build`.
 fn build_bridge(lib_name: &str, include_dirs: &[PathBuf]) {
-    println!("cargo:rerun-if-changed=src/renderer/bridge.rs");
-    println!("cargo:rerun-if-changed=include/map_renderer.h");
-    println!("cargo:rerun-if-changed=include/rust_log_observer.h");
-    cxx_build::bridge("src/renderer/bridge.rs")
+    // println!("cargo:warning=Include_dirs: {:?}", include_dirs);
+    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let bridge_include_dirs: Vec<PathBuf> =
+        BRIDGE_INCLUDE_DIRS.iter().map(|p| root.join(p)).collect();
+    let mut build = cxx_build::bridge("src/renderer/bridge.rs");
+    build
+        .includes(&bridge_include_dirs)
         .includes(include_dirs)
-        .file("src/renderer/bridge.cpp")
         .flag_if_supported("-std=c++20")
-        .compile("maplibre_rust_map_renderer_bindings");
+        .warnings(true)
+        .warnings_into_errors(true);
+
+    for f in BRIDGE_FILES {
+        println!("cargo:rerun-if-changed={f}");
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        if f.ends_with(".cpp") {
+            build.file(f);
+        }
+    }
+
+    build.compile("maplibre_rust_map_renderer_bindings");
 
     // Link mbgl-core after the bridge - or else `cargo test` won't be able to find the symbols.
     println!("cargo:rustc-link-lib=static={lib_name}");
 }
 
-fn build_mln() {
-    let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let (cpp_root, include_dirs) = resolve_mln_core(&root);
+struct Info {
+    lib_name: String,
+    include_dirs: Vec<PathBuf>,
+    cpp_root: PathBuf,
+}
+
+fn bundle_precompiled() -> Info {
+    let (cpp_root, include_dirs) = resolve_mln_core();
+
     println!(
         "cargo:warning=Using precompiled maplibre-native static library from {}",
         cpp_root.display()
     );
+    println!("cargo:rustc-link-search=native={}", cpp_root.parent().unwrap().display());
+
+    // These `cargo:rustc-link-lib` must be done before curl and GL,
+    // especially on Linux before 1.90 (1.90 introduced new linker on Linux)
+    let lib_name = cpp_root
+        .file_name()
+        .expect("static library base has a file name")
+        .to_string_lossy()
+        .to_string()
+        .replacen("lib", "", 1)
+        .replace(".a", "");
+
+    Info { lib_name, include_dirs, cpp_root }
+}
+
+fn build_local(
+    clone_dir: PathBuf,
+    name: &str,
+    amalgam_lib: bool,
+    target_os: &str,
+) -> Result<Info, Box<dyn std::error::Error>> {
+    const TARGET_NAME: &str = "mbgl-core";
+    let maplibre_native_dir = clone_dir.join(name);
+
+    // Some CI cache restores may leave an incomplete directory tree.
+    // Require files that prove this is a usable maplibre-native checkout.
+    let has_required_checkout_files = maplibre_native_dir.join("CMakeLists.txt").is_file()
+        && maplibre_native_dir.join("include").is_dir();
+
+    if maplibre_native_dir.exists() && !has_required_checkout_files {
+        println!(
+            "cargo:warning=Removing incomplete cached maplibre-native checkout at {}",
+            maplibre_native_dir.display()
+        );
+        fs::remove_dir_all(&maplibre_native_dir)?;
+    }
+
+    if !maplibre_native_dir.exists() {
+        println!("cargo:warning=Cloning maplibre-native.");
+        fs::create_dir_all(&clone_dir)?;
+        let clone_status = Command::new("git")
+            .current_dir(clone_dir)
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--revision",
+                MLN_COMMIT,
+                "https://github.com/maplibre/maplibre-native.git",
+                name,
+            ])
+            .status()?;
+        if !clone_status.success() {
+            return Err(
+                format!("Failed to clone maplibre-native repository: {clone_status}").into()
+            );
+        }
+    }
+    // println!("cargo:warning=Building maplibre-native.");
+    println!("cargo:rerun-if-changed={}", maplibre_native_dir.as_os_str().to_str().unwrap());
+    let submodule_status = Command::new("git")
+        .current_dir(maplibre_native_dir.clone())
+        .args(["submodule", "update", "--init", "--recursive"])
+        .status()?;
+    if !submodule_status.success() {
+        return Err(
+            format!("Failed to initialize maplibre-native submodules: {submodule_status}").into()
+        );
+    }
+
+    let mut config = cmake::Config::new(maplibre_native_dir.clone());
+    config.build_target(TARGET_NAME);
+
+    // maplibre-native's platform/darwin/darwin.cmake calls enable_language(Swift),
+    // which the default "Unix Makefiles" generator does not support. Switch to Ninja.
+    if target_os == "macos" || target_os == "ios" {
+        config.generator("Ninja");
+    }
+
+    match GraphicsRenderingAPI::from_selected_features() {
+        GraphicsRenderingAPI::Metal => {
+            config.configure_arg("-DMLN_WITH_METAL=ON");
+        }
+        GraphicsRenderingAPI::OpenGL => {
+            config.configure_arg("-DMLN_WITH_OPENGL=ON");
+        }
+        GraphicsRenderingAPI::Vulkan => {
+            config.configure_arg("-DMLN_WITH_VULKAN=ON");
+        } //GraphicsRenderingAPI::WebGPU => config.configure_arg("-DMLN_WITH_WEBGPU=ON").configure_arg("-DMLN_WEBGPU_IMPL_WGPU=ON"),
+    }
+    if amalgam_lib {
+        config.configure_arg("-DMLN_CREATE_AMALGAMATION:BOOL=ON");
+    }
+    if cfg!(target_os = "linux") {
+        config.configure_arg("-DMLN_WITH_WAYLAND=OFF");
+        config.configure_arg("-DMLN_WITH_X11=ON");
+    }
+    let dest = config.build();
+    println!("cargo:rustc-link-search=native={}", dest.join("build").display());
     println!(
         "cargo:rustc-link-search=native={}",
-        cpp_root.parent().unwrap().display()
+        dest.join("build").join("vendor").join("maplibre-tile-spec").join("cpp").display()
     );
+    // println!("cargo:warning=Building maplibre-native done.");
+
+    // maplibre-native include directories
+    let include_dirs: Vec<PathBuf> = [
+        "include",
+        "platform/default/include",
+        "vendor/maplibre-native-base/include",
+        "vendor/maplibre-native-base/deps/variant/include",
+        "vendor/maplibre-native-base/deps/geometry.hpp/include",
+        "vendor/maplibre-native-base/deps/geojson.hpp/include",
+        "vendor/metal-cpp",
+        "vendor/expected-lite/include",
+    ]
+    .into_iter()
+    .map(|s| maplibre_native_dir.join(s))
+    .collect();
+
+    Ok(Info {
+        lib_name: format!("{TARGET_NAME}{}", if amalgam_lib { "-amalgam" } else { "" }),
+        include_dirs,
+        cpp_root: maplibre_native_dir,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_mln() {
+    println!("cargo:rerun-if-env-changed=MLN_SYSTEM");
+    println!("cargo:rerun-if-env-changed=MLN_PRECOMPILE");
+    println!("cargo:rerun-if-env-changed=MLN_CORE_LIBRARY_USE_AMALGAM");
+    let precompiled = !env::var("MLN_PRECOMPILE").unwrap_or("0".to_string()).eq("0");
+    let amalgam_lib =
+        precompiled || !env::var("MLN_CORE_LIBRARY_USE_AMALGAM").unwrap_or("0".to_string()).eq("0");
+    let system_lib = !env::var("MLN_SYSTEM").unwrap_or("0".to_string()).eq("0");
 
     // Add system library search paths for macOS
-    if cfg!(target_os = "macos") {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+    if target_os == "macos" {
         // Check for Homebrew installation paths
         if let Ok(homebrew_prefix) = env::var("HOMEBREW_PREFIX") {
             println!("cargo:rustc-link-search=native={homebrew_prefix}/lib");
@@ -247,32 +472,101 @@ fn build_mln() {
         }
     }
 
-    // These `cargo:rustc-link-lib` must be done before curl and GL,
-    // especially on Linux before 1.90 (1.90 introduced new linker on Linux)
-    let lib_name = cpp_root
-        .file_name()
-        .expect("static library base has a file name")
-        .to_string_lossy()
-        .to_string()
-        .replacen("lib", "", 1)
-        .replace(".a", "");
-    build_bridge(&lib_name, &include_dirs);
+    let info = if precompiled {
+        bundle_precompiled()
+    } else if system_lib {
+        // Using pkg config
+        // let mut cfg = pkg_config::Config::new();
+        panic!("Not implemented")
+    } else {
+        const MAPLIBRE_NATIVE_DIR_NAME: &str = "maplibre-native";
+        let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let clone_dir = root.join("target");
 
+        match build_local(clone_dir.clone(), MAPLIBRE_NATIVE_DIR_NAME, amalgam_lib, &target_os) {
+            Err(e) => {
+                if clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME).exists() {
+                    // let _ = fs::remove_dir_all(clone_dir.join(MAPLIBRE_NATIVE_DIR_NAME));
+                }
+                panic!("Failed to build maplibre native: {e}")
+            }
+            Ok(info) => info,
+        }
+    };
+
+    build_bridge(&info.lib_name, &info.include_dirs);
+    let is_apple = target_os == "macos" || target_os == "ios";
+    let backend = GraphicsRenderingAPI::from_selected_features();
+    if !amalgam_lib {
+        // The dependent libs are not bundled in the core lib, so we have to link manually
+        // Required for mlt-cpp. Cpp root link search was already added above
+        println!(
+            "cargo:rustc-link-search=native={}",
+            info.cpp_root
+                .parent()
+                .unwrap()
+                .join("vendor")
+                .join("maplibre-tile-spec")
+                .join("cpp")
+                .display()
+        );
+        println!("cargo:rustc-link-lib=mbgl-harfbuzz");
+        println!("cargo:rustc-link-lib=mbgl-freetype");
+        println!("cargo:rustc-link-lib=mbgl-vendor-parsedate");
+        println!("cargo:rustc-link-lib=mbgl-vendor-csscolorparser");
+        println!("cargo:rustc-link-lib=mlt-cpp"); // provided with maplibre-native
+        if is_apple {
+            // darwin builds vendored ICU and uses the system sqlite3
+            println!("cargo:rustc-link-lib=mbgl-vendor-icu");
+            println!("cargo:rustc-link-lib=sqlite3");
+        } else {
+            println!("cargo:rustc-link-lib=mbgl-vendor-nunicode");
+            println!("cargo:rustc-link-lib=mbgl-vendor-sqlite");
+            // println!("cargo:rustc-link-lib=utf8proc"); // sudo dnf install utf8proc-devel
+            println!("cargo:rustc-link-lib=icuuc"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib=icudata"); //sudo dnf install libicu-devel
+            println!("cargo:rustc-link-lib=icui18n"); //sudo dnf install libicu-devel
+        }
+        // Vulkan translates GLSL to SPIR-V at runtime via glslang; OpenGL/Metal don't.
+        if backend == GraphicsRenderingAPI::Vulkan {
+            println!("cargo:rustc-link-lib=glslang"); //sudo dnf install libglslang-devel
+            println!("cargo:rustc-link-lib=glslang-default-resource-limits"); //sudo dnf install libglslang-devel
+
+            // `SPIRV-Tools-opt` depends on symbols from `SPIRV-Tools`.
+            // Keep this order for static linking (notably on Linux/aarch64).
+            println!("cargo:rustc-link-lib=SPIRV-Tools-opt"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
+            println!("cargo:rustc-link-lib=SPIRV-Tools"); //sudo dnf install  spirv-tools-devel // Required by glslang spirv-tools-devel
+        }
+        println!("cargo:rustc-link-lib=png"); // sudo dnf install libpng-devel
+        println!("cargo:rustc-link-lib=jpeg"); // sudo dnf install libjpeg-turbo-devel
+        println!("cargo:rustc-link-lib=uv"); // sudo dnf install libuv-devel
+        println!("cargo:rustc-link-lib=webp"); // sudo dnf install libwebp-devel
+    }
     println!("cargo:rustc-link-lib=curl");
     println!("cargo:rustc-link-lib=z");
-    match GraphicsRenderingAPI::from_selected_features() {
+    if is_apple {
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+    }
+    match backend {
+        GraphicsRenderingAPI::Vulkan if is_apple => {
+            println!("cargo:rustc-link-lib=framework=CoreText");
+            println!("cargo:rustc-link-lib=framework=ImageIO");
+        }
         GraphicsRenderingAPI::Vulkan => {}
         GraphicsRenderingAPI::OpenGL => {
             println!("cargo:rustc-link-lib=GL");
             println!("cargo:rustc-link-lib=EGL");
+            if cfg!(target_os = "linux") {
+                // GLX backend uses X11 symbols such as XInitThreads.
+                println!("cargo:rustc-link-lib=X11");
+            }
         }
         GraphicsRenderingAPI::Metal => {
             // macOS Metal framework dependencies
             println!("cargo:rustc-link-lib=framework=Metal");
             println!("cargo:rustc-link-lib=framework=MetalKit");
             println!("cargo:rustc-link-lib=framework=QuartzCore");
-            println!("cargo:rustc-link-lib=framework=Foundation");
-            println!("cargo:rustc-link-lib=framework=CoreGraphics");
             println!("cargo:rustc-link-lib=framework=AppKit");
             println!("cargo:rustc-link-lib=framework=CoreLocation");
         }

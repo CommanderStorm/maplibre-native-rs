@@ -16,6 +16,7 @@ env_logger.workspace = true
 log.workspace = true
 maplibre_native.workspace = true
 url.workspace = true
+image = {workspace = true, features = ["default-formats"]}
 
 [lints]
 workspace = true

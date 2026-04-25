@@ -1,3 +1,6 @@
+//! Integration tests that the `SingleThreadedRenderPool` can correctly render
+//! map tiles and produce the expected output images.
+
 #![cfg(feature = "pool")]
 
 use std::path::PathBuf;
@@ -9,19 +12,13 @@ fn image_to_png_bytes(image: &Image) -> Vec<u8> {
     let mut png_bytes = Vec::new();
     image
         .as_image()
-        .write_to(
-            &mut std::io::Cursor::new(&mut png_bytes),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
         .unwrap();
     png_bytes
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)
 }
 
 #[tokio::test]
@@ -34,10 +31,7 @@ async fn sequential_errors_dont_break_pool() {
         assert!(result.is_err());
     }
     let working_style = fixture_path("test-style.json");
-    let result = pool
-        .render_tile(working_style.clone(), 1, 0, 0)
-        .await
-        .unwrap();
+    let result = pool.render_tile(working_style.clone(), 1, 0, 0).await.unwrap();
     assert_binary_snapshot!(".png", image_to_png_bytes(&result));
 }
 
@@ -54,10 +48,7 @@ async fn large_coordinates_handled() {
 async fn io_errors() {
     let pool = SingleThreadedRenderPool::global_pool();
 
-    let result = pool
-        .render_tile(PathBuf::from(""), 0, 0, 0)
-        .await
-        .unwrap_err();
+    let result = pool.render_tile(PathBuf::from(""), 0, 0, 0).await.unwrap_err();
     assert_debug_snapshot!(result, @r#"
     IOError(
         Custom {
@@ -67,10 +58,7 @@ async fn io_errors() {
     )
     "#);
 
-    let result = pool
-        .render_tile(PathBuf::from("missing.json"), 0, 0, 0)
-        .await
-        .unwrap_err();
+    let result = pool.render_tile(PathBuf::from("missing.json"), 0, 0, 0).await.unwrap_err();
     assert_debug_snapshot!(result,@r#"
     IOError(
         Custom {
@@ -80,10 +68,8 @@ async fn io_errors() {
     )
     "#);
 
-    let result = pool
-        .render_tile(PathBuf::from("/dev/null/style.json"), 0, 0, 0)
-        .await
-        .unwrap_err();
+    let result =
+        pool.render_tile(PathBuf::from("/dev/null/style.json"), 0, 0, 0).await.unwrap_err();
     assert_debug_snapshot!(result, @r#"
     IOError(
         Custom {
