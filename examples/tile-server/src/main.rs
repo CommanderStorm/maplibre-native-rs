@@ -1,21 +1,19 @@
-//! Tile rendering server example with an async [`moka`] cache and
-//! prefetching.
+//! Tile rendering server with two parallel-Rust caches:
 //!
-//! Layout: a `moka::future::Cache` keyed by `(z, x, y)` holds rendered PNG
-//! tiles. Requests go through `try_get_with`, which dedupes concurrent
-//! callers asking for the same tile. On every request we additionally
-//! kick off background renders of the 8 same-zoom neighbours so that, by
-//! the time the user pans or zooms, those tiles are already in the cache.
+//! 1. **Rendered-PNG cache** keyed by `(z, x, y)` — `try_get_with`
+//!    dedupes concurrent requests for the same tile.
+//! 2. **Resource cache** keyed by URL — every resource mbgl asks for
+//!    (style.json, source TileJSON, vector tiles, glyph PBFs, sprites)
+//!    is served by an async `FileSource` callback running on tokio.
+//!    The callback hits moka first; on miss it fetches via `reqwest`
+//!    or `tokio::fs` and writes the bytes back.
 //!
-//! Pre-fetch tasks share the same cache as the request path: if the user
-//! requests a tile that's already mid-prefetch, `try_get_with` joins the
-//! in-flight future instead of starting a second render. The underlying
-//! [`SingleThreadedRenderPool`] still serialises rendering onto its
-//! worker thread, but the prefetcher fans render requests out so the pool
-//! has work to do during HTTP idle time.
+//! Every byte of network/disk I/O happens off the single-threaded C++
+//! render thread.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
@@ -24,79 +22,39 @@ use axum::{
     routing::get,
     Router,
 };
-use maplibre_native::SingleThreadedRenderPool;
+use bytes::Bytes;
+use maplibre_native::{
+    register_file_source_callback, FileSourceRequestCallback, FsErrorReason, FsResponse,
+    SingleThreadedRenderPool,
+};
 use moka::future::Cache;
 
 type TileKey = (u8, u32, u32);
 
-/// PNG bytes wrapped in `Arc` so cache hits are clone-cheap.
-type TileBytes = Arc<Vec<u8>>;
+/// `Some(bytes)` for a successful body, `None` for a `404`/missing-file
+/// miss that mbgl would otherwise re-issue. Errors are not cached so
+/// transient failures get retried.
+type CachedResource = Option<Bytes>;
+type ResourceCache = Cache<String, CachedResource>;
 
 #[derive(Clone)]
 struct AppState {
-    /// Cache of rendered PNG bytes. Capacity bounded by entry count to
-    /// keep the example simple; a real deployment would weight by bytes.
-    cache: Cache<TileKey, TileBytes>,
-    /// Path to the style.json the server renders.
+    rendered: Cache<TileKey, Bytes>,
     style: Arc<PathBuf>,
 }
 
-/// Render a single tile to PNG bytes. Used both for the request path and
-/// for prefetches — moka dedupes concurrent calls for the same key, so
-/// it's safe to call this from multiple tasks at once.
 async fn render_tile_png(
     style: Arc<PathBuf>,
     (z, x, y): TileKey,
-) -> Result<TileBytes, RenderError> {
+) -> Result<Bytes, RenderError> {
     let image = SingleThreadedRenderPool::global_pool()
         .render_tile((*style).clone(), z, x, y)
-        .await
-        .map_err(RenderError::Pool)?;
-
+        .await?;
     let mut png = Vec::new();
     image
         .as_image()
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(RenderError::Encode)?;
-    Ok(Arc::new(png))
-}
-
-/// 8 same-zoom neighbours, clipped to the valid tile range for `z`.
-/// We deliberately stay on the same zoom level — fanning across zooms
-/// would multiply load. Adjust as needed.
-fn neighbours((z, x, y): TileKey) -> Vec<TileKey> {
-    let max = if z >= 32 { u32::MAX } else { (1u32 << z).saturating_sub(1) };
-    let mut out = Vec::with_capacity(8);
-    for dx in -1i32..=1 {
-        for dy in -1i32..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let nx = x as i64 + dx as i64;
-            let ny = y as i64 + dy as i64;
-            if nx < 0 || ny < 0 || nx > max as i64 || ny > max as i64 {
-                continue;
-            }
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            out.push((z, nx as u32, ny as u32));
-        }
-    }
-    out
-}
-
-/// Spawn cache-populating renders for the given keys, returning
-/// immediately. Each spawned task is a no-op if the key is already
-/// cached or in flight (moka's `try_get_with` deduplicates).
-fn spawn_prefetch(state: AppState, keys: Vec<TileKey>) {
-    for key in keys {
-        let cache = state.cache.clone();
-        let style = state.style.clone();
-        tokio::spawn(async move {
-            // Errors are swallowed: a failed prefetch shouldn't break the
-            // user request, and `try_get_with` does not cache the error.
-            let _ = cache.try_get_with(key, render_tile_png(style, key)).await;
-        });
-    }
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(Bytes::from(png))
 }
 
 async fn rendered_style_tile(
@@ -104,14 +62,8 @@ async fn rendered_style_tile(
     Path((z, x, y)): Path<(u8, u32, u32)>,
 ) -> Result<Response, StatusCode> {
     let key = (z, x, y);
-
-    // Kick off neighbour renders before awaiting the requested tile, so
-    // they get queued onto the render pool concurrently with our own
-    // request rather than waiting for our render to finish first.
-    spawn_prefetch(state.clone(), neighbours(key));
-
     let bytes = state
-        .cache
+        .rendered
         .try_get_with(key, render_tile_png(state.style.clone(), key))
         .await
         .map_err(|e| {
@@ -119,11 +71,10 @@ async fn rendered_style_tile(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let body = axum::body::Body::from((*bytes).clone());
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "image/png")
         .header(header::CACHE_CONTROL, "max-age=3600")
-        .body(body)
+        .body(axum::body::Body::from(bytes))
         .unwrap())
 }
 
@@ -142,18 +93,106 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+async fn fetch_resource(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<CachedResource, FetchError> {
+    if let Some(path) = url.strip_prefix("file://") {
+        match tokio::fs::read(path).await {
+            Ok(v) => Ok(Some(Bytes::from(v))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        let resp = http.get(url).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(FetchError::Status(resp.status()));
+        }
+        Ok(Some(resp.bytes().await?))
+    } else {
+        Err(FetchError::UnsupportedScheme(url.to_owned()))
+    }
+}
+
+async fn get_or_fetch(
+    cache: &ResourceCache,
+    http: &reqwest::Client,
+    url: String,
+) -> Result<CachedResource, Arc<FetchError>> {
+    cache.try_get_with(url.clone(), fetch_resource(http, &url)).await
+}
+
 #[tokio::main]
 async fn main() {
     let style = fixture_path("maplibre_demo.json");
     assert!(style.is_file(), "fixture style not found at {}", style.display());
 
+    let resources: ResourceCache = Cache::builder()
+        .max_capacity(2_000)
+        .time_to_live(Duration::from_secs(3600))
+        .build();
+
+    // Connection pooling matters here: mbgl asks for many glyph PBFs
+    // from the same host in quick succession.
+    let http = reqwest::Client::builder()
+        .user_agent("maplibre-native-rs/tile-server-example")
+        .pool_max_idle_per_host(16)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("http client build");
+
+    // Register BEFORE the pool's `LazyLock` is touched — the pool's
+    // worker thread will then build its renderer with our factory
+    // installed.
+    register_file_source_callback(FileSourceRequestCallback::new_async(
+        tokio::runtime::Handle::current(),
+        {
+            let resources = resources.clone();
+            let http = http.clone();
+            move |url, _| {
+                let resources = resources.clone();
+                let http = http.clone();
+                async move {
+                    match get_or_fetch(&resources, &http, url).await {
+                        Ok(Some(b)) => FsResponse::Ok(b.to_vec()),
+                        Ok(None) => FsResponse::NoContent,
+                        Err(e) => FsResponse::Error {
+                            reason: FsErrorReason::Other,
+                            message: e.to_string(),
+                        },
+                    }
+                }
+            }
+        },
+    ));
+
+    let warmup_urls = [
+        format!("file://{}", style.display()),
+        "https://demotiles.maplibre.org/tiles/tiles.json".to_owned(),
+        // Latin-1 glyph ranges for the two fontstacks the demo style
+        // uses; nearly every render needs these. Real deployments would
+        // parse the style for its full set.
+        "https://demotiles.maplibre.org/font/Open Sans Semibold,Arial Unicode MS Bold/0-255.pbf"
+            .to_owned(),
+        "https://demotiles.maplibre.org/font/Open Sans Regular,Arial Unicode MS Regular/0-255.pbf"
+            .to_owned(),
+    ];
+    for url in warmup_urls {
+        let resources = resources.clone();
+        let http = http.clone();
+        tokio::spawn(async move {
+            let _ = get_or_fetch(&resources, &http, url).await;
+        });
+    }
+
     let state = AppState {
-        // Bound entry count — tune to your tile size and memory budget.
-        // 1024 entries * ~50KB/PNG ≈ 50MB. Use weighted eviction for a
-        // real byte budget.
-        cache: Cache::builder()
+        rendered: Cache::builder()
             .max_capacity(1024)
-            .time_to_live(std::time::Duration::from_secs(3600))
+            .time_to_live(Duration::from_secs(3600))
             .build(),
         style: Arc::new(style),
     };
@@ -170,8 +209,20 @@ async fn main() {
 
 #[derive(Debug, thiserror::Error)]
 enum RenderError {
-    #[error("render pool error: {0}")]
+    #[error("render pool: {0}")]
     Pool(#[from] maplibre_native::SingleThreadedRenderPoolError),
-    #[error("PNG encode error: {0}")]
+    #[error("png encode: {0}")]
     Encode(#[from] image::ImageError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum FetchError {
+    #[error("request: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("status: {0}")]
+    Status(reqwest::StatusCode),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("unsupported scheme: {0}")]
+    UnsupportedScheme(String),
 }

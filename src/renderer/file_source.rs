@@ -198,6 +198,17 @@ fn ffi_response(r: FsResponse) -> crate::renderer::bridge::file_source::RustFsRe
     }
 }
 
+/// Register a [`FileSourceRequestCallback`] as the process-global
+/// `ResourceLoader` factory without going through the builder. Useful
+/// for installing a callback ahead of [`SingleThreadedRenderPool`](crate::SingleThreadedRenderPool),
+/// whose worker thread builds its renderer lazily.
+///
+/// See [`ImageRendererBuilder::with_file_source_callback`](crate::ImageRendererBuilder::with_file_source_callback)
+/// for the singleton/threading caveats — they apply here too.
+pub fn register_file_source_callback(callback: FileSourceRequestCallback) {
+    crate::renderer::bridge::file_source::register_rust_file_source_factory(Box::new(callback));
+}
+
 /// Bridge predicate invoked by C++ to pick sync vs async dispatch.
 pub(crate) fn fs_callback_is_sync(callback: &FileSourceRequestCallback) -> bool {
     match &callback.inner {
