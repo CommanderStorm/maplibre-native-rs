@@ -64,6 +64,7 @@ public:
     ~NoopAsyncRequest() override = default;
 };
 
+#ifdef MLN_ASYNC_FILE_SOURCE
 // Async dispatch: the destructor flips `cancelled` so a late-arriving
 // `FsRequestSink::deliver` becomes a no-op. The spawned Rust task continues
 // to run to completion — its result is discarded after cancellation.
@@ -81,6 +82,7 @@ public:
 private:
     std::shared_ptr<FsRequestShared> shared_;
 };
+#endif // MLN_ASYNC_FILE_SOURCE
 
 class RustFileSource final : public mbgl::FileSource {
 public:
@@ -97,28 +99,29 @@ public:
                          "rust-fs request kind=" + std::to_string(static_cast<unsigned>(resource.kind))
                          + " url=" + resource.url);
 
-        if (fs_callback_is_sync(**callback_)) {
-            // Inline-deliver: callback is sync, response is ready before
-            // we return. Same model as mbgl's in-memory test doubles.
-            const rust::Str url(resource.url.data(), resource.url.size());
-            RustFsResponse rr = fs_invoke_sync(**callback_, url,
-                                               static_cast<uint8_t>(resource.kind));
-            cb(into_response(std::move(rr)));
-            return std::make_unique<NoopAsyncRequest>();
+#ifdef MLN_ASYNC_FILE_SOURCE
+        if (!fs_callback_is_sync(**callback_)) {
+            // Async path: spawn the future, return a cancellable handle.
+            auto shared = std::make_shared<FsRequestShared>();
+            {
+                std::lock_guard<std::mutex> lk(shared->mu);
+                shared->cb = std::move(cb);
+            }
+            auto sink = std::make_unique<FsRequestSink>(shared);
+            fs_invoke_async(**callback_,
+                            rust::String(resource.url.data(), resource.url.size()),
+                            static_cast<uint8_t>(resource.kind),
+                            std::move(sink));
+            return std::make_unique<RustAsyncRequest>(std::move(shared));
         }
+#endif // MLN_ASYNC_FILE_SOURCE
 
-        // Async path: spawn the future, return a cancellable handle.
-        auto shared = std::make_shared<FsRequestShared>();
-        {
-            std::lock_guard<std::mutex> lk(shared->mu);
-            shared->cb = std::move(cb);
-        }
-        auto sink = std::make_unique<FsRequestSink>(shared);
-        fs_invoke_async(**callback_,
-                        rust::String(resource.url.data(), resource.url.size()),
-                        static_cast<uint8_t>(resource.kind),
-                        std::move(sink));
-        return std::make_unique<RustAsyncRequest>(std::move(shared));
+        // Sync path: inline-deliver. Matches mbgl's in-memory test doubles.
+        const rust::Str url(resource.url.data(), resource.url.size());
+        RustFsResponse rr = fs_invoke_sync(**callback_, url,
+                                           static_cast<uint8_t>(resource.kind));
+        cb(into_response(std::move(rr)));
+        return std::make_unique<NoopAsyncRequest>();
     }
 
     bool canRequest(const mbgl::Resource&) const override { return true; }
@@ -145,6 +148,10 @@ private:
 
 } // namespace
 
+// Always defined — the cxx bridge exposes `FsRequestSink` unconditionally
+// so the generated `UniquePtr<FsRequestSink>` has its drop glue available.
+// On sync-only builds the request() branch that constructs sinks is gated
+// behind `MLN_ASYNC_FILE_SOURCE`, so this method is unreachable but linked.
 void FsRequestSink::deliver(RustFsResponse response) noexcept {
     // Move the cb out under the lock, then invoke without the lock held —
     // mbgl's callbacks can re-enter request() in some pipeline stages and

@@ -408,9 +408,13 @@ pub mod map_observer {
     }
 }
 
-// `deliver` is only invoked from `fs_invoke_async`'s async-feature path; on
-// sync-only builds the rust-side stub never calls it, so dead_code fires.
-#[allow(dead_code, clippy::borrow_as_ptr, unused_qualifications)]
+// `deliver`, `FsRequestSink`, and `fs_invoke_async` are only invoked through
+// the async-feature C++ branch (`#ifdef MLN_ASYNC_FILE_SOURCE` in
+// `rust_file_source.cpp`); on sync-only builds the bridge declares them but
+// the call sites are stripped, so the Rust wrappers go unused. cxx::bridge
+// rejects `#[cfg_attr(..., expect(...))]` here, so we fall back to `allow`.
+#[cfg_attr(not(feature = "async"), allow(dead_code))]
+#[allow(clippy::borrow_as_ptr, unused_qualifications)]
 #[cxx::bridge(namespace = "mln::bridge")]
 /// Rust-backed FileSource bridge. See `src/cpp/rust_file_source.{h,cpp}`
 /// for the C++ side.
@@ -431,8 +435,9 @@ pub mod file_source {
         type FileSourceRequestCallback;
 
         /// Returns true if the registered callback is the sync variant.
-        /// C++ uses this to pick the inline-dispatch fast path; async
-        /// callbacks go through the sink/spawn path instead.
+        /// C++ uses this (under `MLN_ASYNC_FILE_SOURCE`) to pick the
+        /// inline-dispatch fast path; async callbacks go through the
+        /// sink/spawn path instead.
         fn fs_callback_is_sync(callback: &FileSourceRequestCallback) -> bool;
 
         /// Sync dispatch: invoke the closure inline and return the

@@ -1,4 +1,4 @@
-//! End-to-end test for the async FileSource callback bridge.
+//! End-to-end test for the async `FileSource` callback bridge.
 //!
 //! Same shape as the sync test, but the callback is `async fn`. The
 //! future yields once via `tokio::task::yield_now` to ensure the spawn /
@@ -12,7 +12,7 @@
 //! doesn't pump a run loop, so async + static is documented as not
 //! recommended; we use a tile renderer here to stay clear of that.
 
-#![cfg(feature = "async-file-source")]
+#![cfg(feature = "async")]
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,4 +1,4 @@
-//! Rust-supplied FileSource callback.
+//! Rust-supplied `FileSource` callback.
 //!
 //! Pair with the C++ side defined in `src/cpp/rust_file_source.{h,cpp}`. The
 //! Rust closure handed to
@@ -11,7 +11,7 @@
 
 use std::fmt::Debug;
 
-#[cfg(feature = "async-file-source")]
+#[cfg(feature = "async")]
 use std::{future::Future, pin::Pin};
 
 /// Kind of resource being requested. Mirrors `mbgl::Resource::Kind` from
@@ -24,7 +24,7 @@ pub enum ResourceKind {
     Unknown = 0,
     /// A style.json.
     Style = 1,
-    /// A TileJSON / source descriptor.
+    /// A `TileJSON` / source descriptor.
     Source = 2,
     /// A single tile (vector or raster).
     Tile = 3,
@@ -92,15 +92,15 @@ pub enum FsResponse {
     },
 }
 
-#[cfg(feature = "async-file-source")]
+#[cfg(feature = "async")]
 type AsyncFsFuture = Pin<Box<dyn Future<Output = FsResponse> + Send + 'static>>;
 
-#[cfg(feature = "async-file-source")]
+#[cfg(feature = "async")]
 type SyncFn = Box<dyn Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static>;
-#[cfg(not(feature = "async-file-source"))]
+#[cfg(not(feature = "async"))]
 type SyncFn = Box<dyn Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static>;
 
-#[cfg(feature = "async-file-source")]
+#[cfg(feature = "async")]
 type AsyncFn = Box<dyn Fn(String, ResourceKind) -> AsyncFsFuture + Send + Sync + 'static>;
 
 /// Internal storage for the registered closure. Sync closures take the
@@ -108,7 +108,7 @@ type AsyncFn = Box<dyn Fn(String, ResourceKind) -> AsyncFsFuture + Send + Sync +
 /// runtime and deliver via `FsRequestSink::deliver` when the future resolves.
 enum FsCallbackKind {
     Sync(SyncFn),
-    #[cfg(feature = "async-file-source")]
+    #[cfg(feature = "async")]
     Async {
         callback: AsyncFn,
         runtime: tokio::runtime::Handle,
@@ -119,13 +119,13 @@ impl Debug for FsCallbackKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Sync(_) => write!(f, "FsCallbackKind::Sync"),
-            #[cfg(feature = "async-file-source")]
+            #[cfg(feature = "async")]
             Self::Async { .. } => write!(f, "FsCallbackKind::Async"),
         }
     }
 }
 
-/// Opaque handle to a registered FileSource closure.
+/// Opaque handle to a registered `FileSource` closure.
 ///
 /// Construct via [`ImageRendererBuilder::with_file_source_callback`](crate::ImageRendererBuilder::with_file_source_callback)
 /// or [`ImageRendererBuilder::with_async_file_source_callback`](crate::ImageRendererBuilder::with_async_file_source_callback).
@@ -163,7 +163,7 @@ impl FileSourceRequestCallback {
     /// the per-request sink. mbgl receives a cancellable handle — when
     /// it drops the handle, the response is discarded (the future itself
     /// runs to completion).
-    #[cfg(feature = "async-file-source")]
+    #[cfg(feature = "async")]
     pub fn new_async<F, Fut>(runtime: tokio::runtime::Handle, callback: F) -> Self
     where
         F: Fn(String, ResourceKind) -> Fut + Send + Sync + 'static,
@@ -209,17 +209,16 @@ pub fn register_file_source_callback(callback: FileSourceRequestCallback) {
     crate::renderer::bridge::file_source::register_rust_file_source_factory(Box::new(callback));
 }
 
-/// Bridge predicate invoked by C++ to pick sync vs async dispatch.
+/// Bridge predicate invoked by C++ (under `MLN_ASYNC_FILE_SOURCE`) to pick
+/// sync vs async dispatch. The body is correct in both feature configs:
+/// without the `async` feature, `FsCallbackKind::Async` does not exist, so
+/// the matches! always returns true.
 pub(crate) fn fs_callback_is_sync(callback: &FileSourceRequestCallback) -> bool {
-    match &callback.inner {
-        FsCallbackKind::Sync(_) => true,
-        #[cfg(feature = "async-file-source")]
-        FsCallbackKind::Async { .. } => false,
-    }
+    matches!(&callback.inner, FsCallbackKind::Sync(_))
 }
 
 /// Bridge sync-dispatch entry point. Invoked by C++ inside
-/// `RustFileSource::request` when `fs_callback_is_sync` returned true.
+/// `RustFileSource::request`.
 pub(crate) fn fs_invoke_sync(
     callback: &FileSourceRequestCallback,
     url: &str,
@@ -227,7 +226,7 @@ pub(crate) fn fs_invoke_sync(
 ) -> crate::renderer::bridge::file_source::RustFsResponse {
     match &callback.inner {
         FsCallbackKind::Sync(f) => ffi_response(f(url, ResourceKind::from_u8(kind))),
-        #[cfg(feature = "async-file-source")]
+        #[cfg(feature = "async")]
         FsCallbackKind::Async { .. } => {
             // The C++ side checks `fs_callback_is_sync` first; reaching
             // here means the dispatch logic on the C++ side has drifted.
@@ -239,45 +238,35 @@ pub(crate) fn fs_invoke_sync(
 /// Bridge async-dispatch entry point. Spawns the closure's future on the
 /// configured tokio runtime; the spawned task takes ownership of the
 /// `FsRequestSink` and calls its `deliver` method when the future resolves.
-#[cfg(feature = "async-file-source")]
+///
+/// The C++ call site is gated by `#ifdef MLN_ASYNC_FILE_SOURCE` (set by
+/// `build.rs` when the cargo `async` feature is enabled). On sync-only
+/// builds the body is empty — the function exists so the cxx bridge has
+/// something to link against, but C++ never reaches it.
+#[cfg(feature = "async")]
 pub(crate) fn fs_invoke_async(
     callback: &FileSourceRequestCallback,
     url: String,
     kind: u8,
     sink: cxx::UniquePtr<crate::renderer::bridge::file_source::FsRequestSink>,
 ) {
-    match &callback.inner {
-        FsCallbackKind::Async { callback: cb, runtime } => {
-            let fut = cb(url, ResourceKind::from_u8(kind));
-            // The sink owns the per-request shared state. The spawned task
-            // moves it in; on drop after `deliver` (or without `deliver`,
-            // if the future was dropped), the sink's destructor releases
-            // its shared_ptr to the request state. The mbgl callback was
-            // moved out under lock during `deliver`, so we never double-fire.
-            runtime.spawn(async move {
-                let response = fut.await;
-                let mut sink = sink;
-                sink.pin_mut().deliver(ffi_response(response));
-            });
-        }
-        FsCallbackKind::Sync(_) => {
-            unreachable!("fs_invoke_async called on sync callback");
-        }
-    }
+    let FsCallbackKind::Async { callback: cb, runtime } = &callback.inner else {
+        // C++ checks `fs_callback_is_sync` first, so this branch is unreachable.
+        return;
+    };
+    let fut = cb(url, ResourceKind::from_u8(kind));
+    runtime.spawn(async move {
+        let response = fut.await;
+        let mut sink = sink;
+        sink.pin_mut().deliver(ffi_response(response));
+    });
 }
 
-/// Bridge stub when async support is compiled out. The C++ side never
-/// invokes this because `fs_callback_is_sync` always returns true on
-/// non-async builds — the dispatch path picks sync inline.
-#[cfg(not(feature = "async-file-source"))]
+#[cfg(not(feature = "async"))]
 pub(crate) fn fs_invoke_async(
     _callback: &FileSourceRequestCallback,
     _url: String,
     _kind: u8,
     _sink: cxx::UniquePtr<crate::renderer::bridge::file_source::FsRequestSink>,
 ) {
-    unreachable!(
-        "async file source callback dispatched without `async-file-source` feature; \
-         enable the feature on the `maplibre_native` crate to use async callbacks"
-    );
 }

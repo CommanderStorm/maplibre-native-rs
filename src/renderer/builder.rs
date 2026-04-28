@@ -8,7 +8,7 @@ use crate::ResourceOptions;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
-#[cfg(feature = "async-file-source")]
+#[cfg(feature = "async")]
 use std::future::Future;
 
 /// Builder for configuring [`ImageRenderer`] instances
@@ -35,9 +35,9 @@ pub struct ImageRendererBuilder {
 
     resource_options: Option<ResourceOptions>,
 
-    /// Optional Rust-supplied FileSource callback. When set, installs a
+    /// Optional Rust-supplied `FileSource` callback. When set, installs a
     /// process-global factory at build time that delegates every resource
-    /// request to this closure, bypassing the mbgl default ResourceLoader.
+    /// request to this closure, bypassing the mbgl default `ResourceLoader`.
     file_source_callback: Option<FileSourceRequestCallback>,
 
     /// Tokio runtime handle used to spawn async file-source futures.
@@ -45,7 +45,7 @@ pub struct ImageRendererBuilder {
     /// caller-supplied via `with_file_source_runtime` takes priority,
     /// otherwise the ambient `Handle::try_current()` is used. If neither
     /// is available, the builder panics.
-    #[cfg(feature = "async-file-source")]
+    #[cfg(feature = "async")]
     file_source_runtime: Option<tokio::runtime::Handle>,
 }
 
@@ -58,7 +58,7 @@ impl Default for ImageRendererBuilder {
             pixel_ratio: 1.0,
             resource_options: None,
             file_source_callback: None,
-            #[cfg(feature = "async-file-source")]
+            #[cfg(feature = "async")]
             file_source_runtime: None,
         }
     }
@@ -100,11 +100,11 @@ impl ImageRendererBuilder {
         self
     }
 
-    /// Install a synchronous Rust closure as the FileSource callback.
+    /// Install a synchronous Rust closure as the `FileSource` callback.
     ///
     /// The closure is invoked for every resource mbgl needs to render the
     /// style (tiles, glyphs, sprites, etc.). It replaces the mbgl default
-    /// ResourceLoader entirely, so the closure must handle every URL
+    /// `ResourceLoader` entirely, so the closure must handle every URL
     /// scheme referenced by the style — typical schemes are `mbtiles://`,
     /// `file://`, and any custom ones the caller needs.
     ///
@@ -113,7 +113,7 @@ impl ImageRendererBuilder {
     /// callbacks, but the render thread blocks while the closure runs —
     /// don't perform network I/O here. Use
     /// [`with_async_file_source_callback`](Self::with_async_file_source_callback)
-    /// (under the `async-file-source` feature) when the callback needs
+    /// (under the `async` feature) when the callback needs
     /// `.await`.
     ///
     /// Registration is **process-global**: `mbgl::FileSourceManager` is a
@@ -139,11 +139,11 @@ impl ImageRendererBuilder {
         self
     }
 
-    /// Install an async Rust closure as the FileSource callback.
+    /// Install an async Rust closure as the `FileSource` callback.
     ///
     /// Each request spawns the closure's future on a tokio runtime; mbgl
     /// receives a cancellable handle and the future's response is
-    /// delivered when it resolves. Suitable for HTTP, S3, async SQLite,
+    /// delivered when it resolves. Suitable for HTTP, S3, async `SQLite`,
     /// or any other backend where blocking the render thread is
     /// unacceptable.
     ///
@@ -168,7 +168,13 @@ impl ImageRendererBuilder {
     /// Same singleton/`Send + Sync` caveats as
     /// [`with_file_source_callback`](Self::with_file_source_callback)
     /// apply.
-    #[cfg(feature = "async-file-source")]
+    ///
+    /// # Panics
+    ///
+    /// Panics if no tokio runtime handle is available — neither supplied
+    /// via [`with_file_source_runtime`](Self::with_file_source_runtime)
+    /// nor accessible via `tokio::runtime::Handle::try_current()`.
+    #[cfg(feature = "async")]
     #[must_use]
     pub fn with_async_file_source_callback<F, Fut>(mut self, callback: F) -> Self
     where
@@ -207,9 +213,8 @@ impl ImageRendererBuilder {
     /// [`with_async_file_source_callback`](Self::with_async_file_source_callback)
     /// is called. Call this method *before* setting the async callback
     /// when you want a specific runtime.
-    #[cfg(feature = "async-file-source")]
+    #[cfg(feature = "async")]
     #[must_use]
-    #[allow(clippy::needless_pass_by_value, reason = "Handle is cheap to clone but the API takes ownership for ergonomics")]
     pub fn with_file_source_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
         self.file_source_runtime = Some(handle);
         self
