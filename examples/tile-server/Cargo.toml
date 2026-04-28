@@ -8,4 +8,6 @@ edition.workspace = true
 axum.workspace = true
 image.workspace = true
 maplibre_native = { workspace = true, features = ["pool"] }
+moka = { version = "0.12", features = ["future"] }
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
