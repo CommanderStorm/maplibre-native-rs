@@ -1,10 +1,15 @@
 //! Image renderer configuration and builder
 
 use crate::renderer::bridge::ffi;
+use crate::renderer::bridge::file_source::register_rust_file_source_factory;
+use crate::renderer::file_source::{FileSourceRequestCallback, FsResponse, ResourceKind};
 use crate::renderer::{Continuous, ImageRenderer, MapMode, Static, Tile};
 use crate::ResourceOptions;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
+
+#[cfg(feature = "async")]
+use std::future::Future;
 
 /// Builder for configuring [`ImageRenderer`] instances
 ///
@@ -29,6 +34,19 @@ pub struct ImageRendererBuilder {
     pixel_ratio: f32,
 
     resource_options: Option<ResourceOptions>,
+
+    /// Optional Rust-supplied `FileSource` callback. When set, installs a
+    /// process-global factory at build time that delegates every resource
+    /// request to this closure, bypassing the mbgl default `ResourceLoader`.
+    file_source_callback: Option<FileSourceRequestCallback>,
+
+    /// Tokio runtime handle used to spawn async file-source futures.
+    /// Resolved at `build_*_renderer` time when an async callback is set:
+    /// caller-supplied via `with_file_source_runtime` takes priority,
+    /// otherwise the ambient `Handle::try_current()` is used. If neither
+    /// is available, the builder panics.
+    #[cfg(feature = "async")]
+    file_source_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl Default for ImageRendererBuilder {
@@ -39,6 +57,9 @@ impl Default for ImageRendererBuilder {
             height: NonZeroU32::new(512).unwrap(),
             pixel_ratio: 1.0,
             resource_options: None,
+            file_source_callback: None,
+            #[cfg(feature = "async")]
+            file_source_runtime: None,
         }
     }
 }
@@ -79,6 +100,113 @@ impl ImageRendererBuilder {
         self
     }
 
+    /// Install a synchronous Rust closure as the `FileSource` callback.
+    ///
+    /// The closure is invoked for every resource mbgl needs to render the
+    /// style (tiles, glyphs, sprites, etc.). It replaces the mbgl default
+    /// `ResourceLoader` entirely, so the closure must handle every URL
+    /// scheme referenced by the style — typical schemes are `mbtiles://`,
+    /// `file://`, and any custom ones the caller needs.
+    ///
+    /// Sync dispatch invokes the closure inline on whichever thread mbgl
+    /// makes the request from. This is fast for SQLite/filesystem-backed
+    /// callbacks, but the render thread blocks while the closure runs —
+    /// don't perform network I/O here. Use
+    /// [`with_async_file_source_callback`](Self::with_async_file_source_callback)
+    /// (under the `async` feature) when the callback needs
+    /// `.await`.
+    ///
+    /// Registration is **process-global**: `mbgl::FileSourceManager` is a
+    /// singleton, so a later call to `build_*_renderer` replaces the
+    /// factory for all *future* `ImageRenderer` instances. Existing
+    /// renderers keep their original callback because mbgl captured their
+    /// `FileSource` at `Map`-construction time. In practice, running two
+    /// renderers in one process with *different* callbacks is unsupported
+    /// — use one process per callback.
+    ///
+    /// `Send + Sync` are required because mbgl may invoke the same
+    /// captured callback from multiple renderers on independent threads;
+    /// the closure must be safe for concurrent use.
+    ///
+    /// Calling this method overwrites a previously-set async callback
+    /// (and vice versa) — only one variant is registered.
+    #[must_use]
+    pub fn with_file_source_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static,
+    {
+        self.file_source_callback = Some(FileSourceRequestCallback::new_sync(callback));
+        self
+    }
+
+    /// Install an async Rust closure as the `FileSource` callback.
+    ///
+    /// Each request spawns the closure's future on a tokio runtime; mbgl
+    /// receives a cancellable handle and the future's response is
+    /// delivered when it resolves. Suitable for HTTP, S3, async `SQLite`,
+    /// or any other backend where blocking the render thread is
+    /// unacceptable.
+    ///
+    /// **Threading**: deliveries land on whatever tokio worker resolved
+    /// the future. mbgl's pipeline tolerates this in `Continuous` and
+    /// `Tile` modes. Static rendering doesn't pump a run loop, so async
+    /// callbacks combined with `build_static_renderer` are not
+    /// recommended — prefer the sync variant for static rendering.
+    ///
+    /// **Cancellation**: when mbgl drops its `AsyncRequest` handle, the
+    /// per-request sink swallows the eventual response. The future itself
+    /// runs to completion — discard-on-arrival, not abort. If you need
+    /// real cancellation, propagate it inside the closure (e.g. via a
+    /// `CancellationToken` baked into your closure's captures).
+    ///
+    /// **Runtime**: pass an explicit handle via
+    /// [`with_file_source_runtime`](Self::with_file_source_runtime), or
+    /// call this method from within a tokio context — `Handle::try_current()`
+    /// is consulted as a fallback. If neither is available, building the
+    /// renderer panics.
+    ///
+    /// Same singleton/`Send + Sync` caveats as
+    /// [`with_file_source_callback`](Self::with_file_source_callback)
+    /// apply.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no tokio runtime handle is available — neither supplied
+    /// via [`with_file_source_runtime`](Self::with_file_source_runtime)
+    /// nor accessible via `tokio::runtime::Handle::try_current()`.
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub fn with_async_file_source_callback<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(String, ResourceKind) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FsResponse> + Send + 'static,
+    {
+        let runtime = self
+            .file_source_runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            .expect(
+                "with_async_file_source_callback: no tokio runtime — call \
+                 with_file_source_runtime first or build inside a runtime",
+            );
+        self.file_source_callback =
+            Some(FileSourceRequestCallback::new_async(runtime, callback));
+        self
+    }
+
+    /// Provide a tokio runtime handle for spawning async file-source
+    /// callbacks. Optional — if unset, the builder uses the ambient
+    /// `tokio::runtime::Handle::current()` at the moment
+    /// [`with_async_file_source_callback`](Self::with_async_file_source_callback)
+    /// is called. Call this method *before* setting the async callback
+    /// when you want a specific runtime.
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub fn with_file_source_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.file_source_runtime = Some(handle);
+        self
+    }
+
     /// Builds a static image renderer
     #[must_use]
     pub fn build_static_renderer(self) -> ImageRenderer<Static> {
@@ -104,6 +232,13 @@ impl ImageRendererBuilder {
 impl<S> ImageRenderer<S> {
     /// Creates a new renderer instance
     fn new(map_mode: MapMode, opts: ImageRendererBuilder) -> Self {
+        // Install the FileSource callback BEFORE constructing the C++
+        // renderer: mbgl::Map resolves its FileSource during construction,
+        // so the factory has to be in place by then.
+        if let Some(callback) = opts.file_source_callback {
+            register_rust_file_source_factory(Box::new(callback));
+        }
+
         let resource_options = opts.resource_options.unwrap_or_default();
         let map = ffi::MapRenderer_new(
             map_mode,

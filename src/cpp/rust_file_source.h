@@ -11,36 +11,52 @@
 //
 // Factory registration is process-global (mbgl::FileSourceManager is a
 // singleton). Call `register_rust_file_source_factory` once before any
-// `mbgl::Map` is constructed.
+// `mbgl::Map` is constructed. A subsequent call replaces the previous
+// callback but leaves existing RustFileSource instances alive until their
+// owning Map is destroyed.
 //
-// `FileSourceManager` *also* caches FileSource instances by `(type,
-// ResourceOptions)`; `registerFileSourceFactory` only swaps the factory
-// slot and never evicts the cache. A subsequent call therefore takes
-// effect only for `Map`s constructed with `ResourceOptions` that don't
-// already have a live cached FileSource — in practice, only after every
-// previously built renderer has been dropped, or by varying
-// `ResourceOptions` (e.g. a unique `platformContext`) per renderer. Two
-// concurrent renderers with different callbacks are not supported by
-// this layer.
+// The async dispatch path is compiled in only when build.rs sets
+// `MLN_ASYNC_FILE_SOURCE` (mirroring the cargo `async` feature).
 
 #include "rust/cxx.h"
-#include <mbgl/storage/resource.hpp>
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <mutex>
+
 #include <mbgl/storage/response.hpp>
 
 namespace mln {
 namespace bridge {
 
-// cxx doesn't support nested enums directly, so flatten mbgl's
-// `Resource::Kind` and `Response::Error::Reason` into top-level aliases
-// the cxx::bridge can pick up. Same pattern as `MapObserverCameraChangeMode`
-// in src/cpp/map_observer.h. Names + discriminants must stay aligned with
-// the Rust-side enum declarations in src/renderer/bridge.rs; cxx codegen
-// validates the match at compile time.
-using ResourceKind = mbgl::Resource::Kind;
-using FsErrorReason = mbgl::Response::Error::Reason;
-
-// Opaque Rust type — defined in src/renderer/file_source.rs.
+// Opaque Rust types — defined in src/renderer/file_source.rs.
 struct FileSourceRequestCallback;
+struct RustFsResponse;
+
+// Shared state between an in-flight request's `RustAsyncRequest` (held by
+// mbgl as the cancellation handle) and its `FsRequestSink` (held by the
+// spawned Rust task). Owned by `shared_ptr` on both sides. Always defined
+// so the cxx-generated bridge can take pointers to `FsRequestSink` even on
+// sync-only builds; the async-specific call sites in `rust_file_source.cpp`
+// stay gated behind `MLN_ASYNC_FILE_SOURCE`.
+struct FsRequestShared {
+    std::mutex mu;
+    std::atomic<bool> cancelled{false};
+    // mbgl's per-request callback. Cleared after delivery or on cancellation.
+    std::function<void(mbgl::Response)> cb;
+};
+
+class FsRequestSink {
+public:
+    explicit FsRequestSink(std::shared_ptr<FsRequestShared> shared) noexcept
+        : shared_(std::move(shared)) {}
+
+    void deliver(RustFsResponse response) noexcept;
+
+private:
+    std::shared_ptr<FsRequestShared> shared_;
+};
 
 // Implementation in rust_file_source.cpp.
 void register_rust_file_source_factory(rust::Box<FileSourceRequestCallback> callback);

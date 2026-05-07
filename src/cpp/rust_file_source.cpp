@@ -8,9 +8,9 @@
 #include <mbgl/storage/response.hpp>
 #include <mbgl/util/async_request.hpp>
 #include <mbgl/util/client_options.hpp>
-#include <mbgl/util/logging.hpp>
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -19,14 +19,69 @@ namespace bridge {
 
 namespace {
 
-// AsyncRequest subclass whose destructor cancels. Our dispatch is synchronous
-// so by the time this handle reaches the caller the callback has already
-// fired — cancellation is a structural no-op.
+// Compile-time cross-checks: the Rust-side `ResourceKind` and `FsErrorReason`
+// enums duplicate mbgl discriminants over the cxx boundary as raw u8. Pin
+// each discriminant so an upstream mbgl reorder fails the build instead of
+// silently mapping tile requests to spritejson requests.
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Unknown)      == 0, "ResourceKind::Unknown discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Style)        == 1, "ResourceKind::Style discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Source)       == 2, "ResourceKind::Source discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Tile)         == 3, "ResourceKind::Tile discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Glyphs)       == 4, "ResourceKind::Glyphs discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::SpriteImage)  == 5, "ResourceKind::SpriteImage discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::SpriteJSON)   == 6, "ResourceKind::SpriteJSON discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Resource::Kind::Image)        == 7, "ResourceKind::Image discriminant drift");
+
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::Success)    != 0, "FsErrorReason sentinel 0 collides with Success");
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::NotFound)   == 2, "FsErrorReason::NotFound discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::Server)     == 3, "FsErrorReason::Server discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::Connection) == 4, "FsErrorReason::Connection discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::RateLimit)  == 5, "FsErrorReason::RateLimit discriminant drift");
+static_assert(static_cast<uint8_t>(mbgl::Response::Error::Reason::Other)      == 6, "FsErrorReason::Other discriminant drift");
+
+mbgl::Response into_response(RustFsResponse rr) {
+    mbgl::Response response;
+    if (rr.error_reason != 0) {
+        response.error = std::make_unique<mbgl::Response::Error>(
+            static_cast<mbgl::Response::Error::Reason>(rr.error_reason),
+            std::string(rr.error_message.data(), rr.error_message.size()));
+        return response;
+    }
+    response.noContent = rr.no_content;
+    if (!rr.no_content && !rr.data.empty()) {
+        response.data = std::make_shared<std::string>(
+            reinterpret_cast<const char*>(rr.data.data()),
+            rr.data.size());
+    }
+    return response;
+}
+
+// Sync dispatch: the callback already returned, so cancellation is structural.
 class NoopAsyncRequest final : public mbgl::AsyncRequest {
 public:
     NoopAsyncRequest() = default;
     ~NoopAsyncRequest() override = default;
 };
+
+#ifdef MLN_ASYNC_FILE_SOURCE
+// Async dispatch: the destructor flips `cancelled` so a late-arriving
+// `FsRequestSink::deliver` becomes a no-op. The spawned Rust task continues
+// to run to completion — its result is discarded after cancellation.
+class RustAsyncRequest final : public mbgl::AsyncRequest {
+public:
+    explicit RustAsyncRequest(std::shared_ptr<FsRequestShared> shared) noexcept
+        : shared_(std::move(shared)) {}
+
+    ~RustAsyncRequest() override {
+        std::lock_guard<std::mutex> lk(shared_->mu);
+        shared_->cancelled.store(true, std::memory_order_release);
+        shared_->cb = nullptr;
+    }
+
+private:
+    std::shared_ptr<FsRequestShared> shared_;
+};
+#endif // MLN_ASYNC_FILE_SOURCE
 
 class RustFileSource final : public mbgl::FileSource {
 public:
@@ -39,14 +94,28 @@ public:
 
     std::unique_ptr<mbgl::AsyncRequest> request(const mbgl::Resource& resource,
                                                 Callback cb) override {
-        // Static-render mode has no pumped run loop on the render thread, so
-        // posting the callback via `RunLoop::Get()->invokeCancellable` would
-        // deadlock the `frontend->render` call waiting for its own tile.
-        // Sync dispatch is safe because Rust-backed sources (mbtiles SQLite,
-        // filesystem read) don't block long enough to matter, matching mbgl's
-        // in-memory test doubles. Per-request tracing happens on the Rust
-        // side in `fs_request_callback`.
-        cb(invokeCallback(resource));
+#ifdef MLN_ASYNC_FILE_SOURCE
+        if (!fs_callback_is_sync(**callback_)) {
+            // Async path: spawn the future, return a cancellable handle.
+            auto shared = std::make_shared<FsRequestShared>();
+            {
+                std::lock_guard<std::mutex> lk(shared->mu);
+                shared->cb = std::move(cb);
+            }
+            auto sink = std::make_unique<FsRequestSink>(shared);
+            fs_invoke_async(**callback_,
+                            rust::String(resource.url.data(), resource.url.size()),
+                            static_cast<uint8_t>(resource.kind),
+                            std::move(sink));
+            return std::make_unique<RustAsyncRequest>(std::move(shared));
+        }
+#endif // MLN_ASYNC_FILE_SOURCE
+
+        // Sync path: inline-deliver. Matches mbgl's in-memory test doubles.
+        const rust::Str url(resource.url.data(), resource.url.size());
+        RustFsResponse rr = fs_invoke_sync(**callback_, url,
+                                           static_cast<uint8_t>(resource.kind));
+        cb(into_response(std::move(rr)));
         return std::make_unique<NoopAsyncRequest>();
     }
 
@@ -67,39 +136,27 @@ public:
     }
 
 private:
-    mbgl::Response invokeCallback(const mbgl::Resource& resource) {
-        const rust::Str url(resource.url.data(), resource.url.size());
-        RustFsResponse rr = fs_request_callback(**callback_, url, resource.kind);
-
-        mbgl::Response response;
-        if (rr.error_reason != FsErrorReason::Success) {
-            response.error = std::make_unique<mbgl::Response::Error>(
-                rr.error_reason,
-                std::string(rr.error_message.data(), rr.error_message.size()));
-            return response;
-        }
-
-        response.noContent = rr.no_content;
-        if (!rr.no_content) {
-            // Always materialise `data` for non-NoContent successes, even
-            // when zero-length: a default-constructed `shared_ptr` reads as
-            // "no data set" downstream and is indistinguishable from a
-            // failed response. The Rust `Vec<u8>` was moved across the cxx
-            // boundary (no copy); the std::string construction is the one
-            // unavoidable copy — mbgl insists on `shared_ptr<const std::string>`.
-            response.data = std::make_shared<std::string>(
-                reinterpret_cast<const char*>(rr.data.data()),
-                rr.data.size());
-        }
-        return response;
-    }
-
     std::shared_ptr<rust::Box<FileSourceRequestCallback>> callback_;
     mbgl::ResourceOptions resourceOpts_;
     mbgl::ClientOptions clientOpts_;
 };
 
 } // namespace
+
+void FsRequestSink::deliver(RustFsResponse response) noexcept {
+    // Move the cb out under the lock, then invoke without the lock held —
+    // mbgl's callbacks can re-enter request() in some pipeline stages and
+    // we don't want them blocked on our mutex.
+    std::function<void(mbgl::Response)> cb;
+    {
+        std::lock_guard<std::mutex> lk(shared_->mu);
+        if (shared_->cancelled.load(std::memory_order_acquire)) return;
+        if (!shared_->cb) return;
+        cb = std::move(shared_->cb);
+        shared_->cb = nullptr;
+    }
+    cb(into_response(std::move(response)));
+}
 
 void register_rust_file_source_factory(rust::Box<FileSourceRequestCallback> callback) {
     auto shared_callback = std::make_shared<rust::Box<FileSourceRequestCallback>>(std::move(callback));

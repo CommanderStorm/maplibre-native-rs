@@ -3,7 +3,9 @@ use crate::renderer::callbacks::{
     void_callback, CameraDidChangeCallback, FailingLoadingMapCallback,
     FinishRenderingFrameCallback, VoidCallback,
 };
-use crate::renderer::file_source::{fs_request_callback, FileSourceRequestCallback};
+use crate::renderer::file_source::{
+    fs_callback_is_sync, fs_invoke_async, fs_invoke_sync, FileSourceRequestCallback,
+};
 use std::fmt::Display;
 use std::ops::Sub;
 
@@ -406,62 +408,25 @@ pub mod map_observer {
     }
 }
 
+// `deliver`, `FsRequestSink`, and `fs_invoke_async` are only invoked through
+// the async-feature C++ branch (`#ifdef MLN_ASYNC_FILE_SOURCE` in
+// `rust_file_source.cpp`); on sync-only builds the bridge declares them but
+// the call sites are stripped, so the Rust wrappers go unused. cxx::bridge
+// rejects `#[cfg_attr(..., expect(...))]` here, so we fall back to `allow`.
+#[cfg_attr(not(feature = "async"), allow(dead_code))]
 #[allow(clippy::borrow_as_ptr, unused_qualifications)]
 #[cxx::bridge(namespace = "mln::bridge")]
 /// Rust-backed FileSource bridge. See `src/cpp/rust_file_source.{h,cpp}`
 /// for the C++ side.
 pub mod file_source {
-    #[namespace = "mln::bridge"]
-    #[repr(u8)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    /// Resource kinds — mirror of `mbgl::Resource::Kind`.
-    pub enum ResourceKind {
-        /// Unknown / unspecified resource kind.
-        Unknown = 0,
-        /// A style.json.
-        Style = 1,
-        /// A TileJSON / source descriptor.
-        Source = 2,
-        /// A single tile (vector or raster).
-        Tile = 3,
-        /// A glyph PBF range.
-        Glyphs = 4,
-        /// A sprite sheet PNG.
-        SpriteImage = 5,
-        /// A sprite sheet JSON.
-        SpriteJSON = 6,
-        /// A generic image resource.
-        Image = 7,
-    }
-
-    #[namespace = "mln::bridge"]
-    #[repr(u8)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    /// Error reason categories — mirror of `mbgl::Response::Error::Reason`.
-    pub enum FsErrorReason {
-        /// mbgl's "no error" sentinel; not a meaningful error category.
-        Success = 1,
-        /// Resource not found at the requested URL.
-        NotFound = 2,
-        /// Server-side error (5xx and similar).
-        Server = 3,
-        /// Transport-level connection failure.
-        Connection = 4,
-        /// Rate-limit response.
-        RateLimit = 5,
-        /// Any other error.
-        Other = 6,
-    }
-
-    /// FFI shape for a resource-request response. `error_reason ==
-    /// FsErrorReason::Success` means no error; any other value is the
-    /// mbgl reason that gets attached to the `mbgl::Response::Error`.
-    /// `no_content == true` with `error_reason == Success` is a
-    /// well-formed miss (e.g. tile not present).
+    /// FFI shape for a resource-request response. `error_reason == 0`
+    /// means success; non-zero values map directly onto
+    /// `mbgl::Response::Error::Reason`. `no_content == true` with
+    /// `error_reason == 0` is a well-formed miss (e.g. tile not present).
     #[derive(Debug)]
     pub struct RustFsResponse {
         pub data: Vec<u8>,
-        pub error_reason: FsErrorReason,
+        pub error_reason: u8,
         pub error_message: String,
         pub no_content: bool,
     }
@@ -469,23 +434,56 @@ pub mod file_source {
     extern "Rust" {
         type FileSourceRequestCallback;
 
-        fn fs_request_callback(
+        /// Returns true if the registered callback is the sync variant.
+        /// C++ uses this (under `MLN_ASYNC_FILE_SOURCE`) to pick the
+        /// inline-dispatch fast path; async callbacks go through the
+        /// sink/spawn path instead.
+        fn fs_callback_is_sync(callback: &FileSourceRequestCallback) -> bool;
+
+        /// Sync dispatch: invoke the closure inline and return the
+        /// response. Called from C++ inside `RustFileSource::request`.
+        fn fs_invoke_sync(
             callback: &FileSourceRequestCallback,
             url: &str,
-            kind: ResourceKind,
+            kind: u8,
         ) -> RustFsResponse;
+
+        /// Async dispatch: spawn the closure's future on the runtime,
+        /// move `sink` into the spawned task, and let the task call
+        /// `sink.deliver(...)` when the future resolves. Returns
+        /// immediately so `RustFileSource::request` can return its
+        /// `RustAsyncRequest` cancellation handle.
+        fn fs_invoke_async(
+            callback: &FileSourceRequestCallback,
+            url: String,
+            kind: u8,
+            sink: UniquePtr<FsRequestSink>,
+        );
     }
 
     unsafe extern "C++" {
         include!("rust_file_source.h");
-        type ResourceKind;
-        type FsErrorReason;
+
+        /// Opaque C++ holder of the per-request mbgl callback + cancel
+        /// flag. Moved into the spawned Rust task; dropped after delivery.
+        type FsRequestSink;
+
+        /// Deliver the response and invoke the underlying mbgl callback.
+        /// No-op if the request has already been cancelled by mbgl
+        /// dropping its `RustAsyncRequest` handle.
+        fn deliver(self: Pin<&mut FsRequestSink>, response: RustFsResponse);
 
         /// Install the Rust closure as the `ResourceLoader` file source
         /// factory. Process-global; replaces any previous callback.
         fn register_rust_file_source_factory(callback: Box<FileSourceRequestCallback>);
     }
 }
+
+// The sink is internally synchronized via std::mutex on the C++ side, and
+// is only ever held by one Rust owner at a time (the spawned task that owns
+// the `UniquePtr`). Marking it Send lets `UniquePtr<FsRequestSink>` cross
+// thread boundaries when moved into a tokio task.
+unsafe impl Send for file_source::FsRequestSink {}
 
 #[allow(clippy::borrow_as_ptr)]
 #[cxx::bridge(namespace = "mln::bridge")]

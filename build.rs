@@ -281,6 +281,10 @@ fn build_bridge(lib_name: &str, include_dirs: &[PathBuf]) {
         .warnings(true)
         .warnings_into_errors(true);
 
+    if env::var("CARGO_FEATURE_ASYNC").is_ok() {
+        build.define("MLN_ASYNC_FILE_SOURCE", None);
+    }
+
     for f in BRIDGE_FILES {
         println!("cargo:rerun-if-changed={f}");
         #[allow(clippy::case_sensitive_file_extension_comparisons)]

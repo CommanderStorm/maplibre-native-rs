@@ -1,20 +1,77 @@
 //! Rust-supplied `FileSource` callback.
 //!
 //! Pair with the C++ side defined in `src/cpp/rust_file_source.{h,cpp}`. The
-//! Rust closure handed to [`register_file_source_callback`] serves every
-//! resource mbgl asks for — styles, tilesets, tiles, glyphs, sprites,
-//! images. The URL scheme is not filtered on the C++ side, so the callback
-//! owns scheme dispatch (e.g. `mbtiles://`, `file://`, custom).
+//! Rust closure handed to
+//! [`ImageRendererBuilder::with_file_source_callback`](crate::ImageRendererBuilder::with_file_source_callback)
+//! (or its async sibling
+//! [`ImageRendererBuilder::with_async_file_source_callback`](crate::ImageRendererBuilder::with_async_file_source_callback))
+//! serves every resource mbgl asks for — styles, tilesets, tiles, glyphs,
+//! sprites, images. The URL scheme is not filtered on the C++ side, so the
+//! callback owns scheme dispatch (e.g. `mbtiles://`, `file://`, custom).
 
-// Required by the `callback!` macro expansion: it emits
-// `impl Debug for $callback_name`, so `Debug` must be in scope as a
-// trait, not just a derive macro.
 use std::fmt::Debug;
 
-use crate::renderer::bridge::file_source::{
-    register_rust_file_source_factory, FsErrorReason, ResourceKind,
-};
-use crate::renderer::callbacks::callback;
+#[cfg(feature = "async")]
+use std::{future::Future, pin::Pin};
+
+/// Kind of resource being requested. Mirrors `mbgl::Resource::Kind` from
+/// `mbgl/storage/resource.hpp`; discriminant values are pinned byte-for-byte
+/// to that enum by `static_assert`s in `rust_file_source.cpp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResourceKind {
+    /// Unknown / unspecified resource kind.
+    Unknown = 0,
+    /// A style.json.
+    Style = 1,
+    /// A `TileJSON` / source descriptor.
+    Source = 2,
+    /// A single tile (vector or raster).
+    Tile = 3,
+    /// A glyph PBF range.
+    Glyphs = 4,
+    /// A sprite sheet PNG.
+    SpriteImage = 5,
+    /// A sprite sheet JSON.
+    SpriteJSON = 6,
+    /// A generic image resource.
+    Image = 7,
+}
+
+impl ResourceKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Style,
+            2 => Self::Source,
+            3 => Self::Tile,
+            4 => Self::Glyphs,
+            5 => Self::SpriteImage,
+            6 => Self::SpriteJSON,
+            7 => Self::Image,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Error reason for a failed resource request. Mirrors
+/// `mbgl::Response::Error::Reason`; discriminant values are pinned to that
+/// enum by `static_assert`s in `rust_file_source.cpp`. The `0` discriminant
+/// is intentionally reserved on the FFI side to mean "no error" —
+/// `mbgl::Response::Error::Reason` starts at `Success = 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FsErrorReason {
+    /// Resource not found at the requested URL.
+    NotFound = 2,
+    /// Server-side error (5xx, etc.).
+    Server = 3,
+    /// Transport-level connection failure.
+    Connection = 4,
+    /// Rate-limit response.
+    RateLimit = 5,
+    /// Any other error.
+    Other = 6,
+}
 
 /// Return value for a resource request callback.
 #[derive(Debug)]
@@ -26,9 +83,7 @@ pub enum FsResponse {
     /// body. Overzoomed tiles should use this rather than [`FsResponse::Error`].
     NoContent,
     /// Request failed. The reason maps directly to the mbgl error enum so
-    /// mbgl-internal retry/backoff logic still applies. Don't use
-    /// [`FsErrorReason::Success`] here — pick `Other` if no other variant
-    /// fits.
+    /// mbgl-internal retry/backoff logic still applies.
     Error {
         /// Category of failure.
         reason: FsErrorReason,
@@ -37,83 +92,181 @@ pub enum FsResponse {
     },
 }
 
-// Send + Sync are load-bearing: `mbgl::FileSourceManager` is a singleton, so
-// the same callback is captured by every `RustFileSource` instance that the
-// factory produces. If a consumer constructs more than one `ImageRenderer`
-// (or mbgl ever spawns a second file-source-owning thread upstream), the
-// callback will be invoked from multiple threads and must be thread-safe.
-callback!(FileSourceRequestCallback,
-          Fn(&str, ResourceKind) -> FsResponse,
-          Send, Sync);
+#[cfg(feature = "async")]
+type AsyncFsFuture = Pin<Box<dyn Future<Output = FsResponse> + Send + 'static>>;
 
-/// Install a Rust closure as the `ResourceLoader` file-source callback for
-/// every subsequently constructed `mbgl::Map`.
-///
-/// The closure is invoked for every resource mbgl needs to render the
-/// style — tiles, glyphs, sprites, source manifests, etc. It replaces the
-/// mbgl default `ResourceLoader` entirely, so the closure owns URL-scheme
-/// dispatch (`mbtiles://`, `file://`, `https://`, custom).
-///
-/// # Process-global, with caching subtleties
-///
-/// `mbgl::FileSourceManager` is a process-wide singleton and this call
-/// mutates global state. There are two layers to be aware of:
-///
-/// 1. **Factory replacement.** A subsequent call replaces the registered
-///    factory; the prior closure is dropped once no `RustFileSource`
-///    instance still references it.
-/// 2. **Instance cache.** `FileSourceManager` *also* caches `FileSource`
-///    instances keyed by `(type, ResourceOptions)`. `getFileSource` returns
-///    the cached instance via `weak_ptr::lock()` whenever it's still alive,
-///    bypassing the factory. So replacing the callback while any prior
-///    renderer (built with the same `ResourceOptions`) is still in scope
-///    has no effect on either the prior renderer *or* on new renderers
-///    that share its `ResourceOptions` — they all keep using the original
-///    closure until the cached instance is dropped.
-///
-/// In practice: install the callback once, before constructing any
-/// renderer, and keep it for the process lifetime. Two concurrent
-/// renderers requiring different callbacks are not supported by this
-/// layer.
-///
-/// `Send + Sync` are required because mbgl may invoke the same closure
-/// from multiple renderer threads concurrently.
-pub fn register_file_source_callback<F>(callback: F)
-where
-    F: Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static,
-{
-    register_rust_file_source_factory(Box::new(FileSourceRequestCallback::new(callback)));
+type SyncFn = Box<dyn Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static>;
+
+#[cfg(feature = "async")]
+type AsyncFn = Box<dyn Fn(String, ResourceKind) -> AsyncFsFuture + Send + Sync + 'static>;
+
+/// Internal storage for the registered closure. Sync closures take the
+/// inline dispatch path; async closures spawn on the configured tokio
+/// runtime and deliver via `FsRequestSink::deliver` when the future resolves.
+enum FsCallbackKind {
+    Sync(SyncFn),
+    #[cfg(feature = "async")]
+    Async {
+        callback: AsyncFn,
+        runtime: tokio::runtime::Handle,
+    },
 }
 
-/// Bridge function invoked by C++ for every resource request. Not called
-/// directly from user code — exposed via the cxx bridge in
-/// `src/renderer/bridge.rs`.
-pub(crate) fn fs_request_callback(
-    callback: &FileSourceRequestCallback,
-    url: &str,
-    kind: ResourceKind,
-) -> crate::renderer::bridge::file_source::RustFsResponse {
+impl Debug for FsCallbackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sync(_) => write!(f, "FsCallbackKind::Sync"),
+            #[cfg(feature = "async")]
+            Self::Async { .. } => write!(f, "FsCallbackKind::Async"),
+        }
+    }
+}
+
+/// Opaque handle to a registered `FileSource` closure.
+///
+/// Construct via [`ImageRendererBuilder::with_file_source_callback`](crate::ImageRendererBuilder::with_file_source_callback)
+/// or [`ImageRendererBuilder::with_async_file_source_callback`](crate::ImageRendererBuilder::with_async_file_source_callback).
+/// Stored on the builder until `build_*_renderer` registers it with mbgl.
+//
+// `Send + Sync` are load-bearing: `mbgl::FileSourceManager` is a singleton,
+// so the same callback is captured by every `RustFileSource` instance that
+// the factory produces. If a consumer constructs more than one
+// `ImageRenderer` (or mbgl ever spawns a second file-source-owning thread
+// upstream), the callback will be invoked from multiple threads and must
+// be thread-safe.
+pub struct FileSourceRequestCallback {
+    inner: FsCallbackKind,
+}
+
+impl Debug for FileSourceRequestCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSourceRequestCallback").field("kind", &self.inner).finish()
+    }
+}
+
+impl FileSourceRequestCallback {
+    /// Wrap a sync closure. The closure is invoked inline on whatever
+    /// thread mbgl issues the request from — fast for SQLite/filesystem
+    /// backends, but slow callbacks will stall the render thread.
+    pub fn new_sync<F>(callback: F) -> Self
+    where
+        F: Fn(&str, ResourceKind) -> FsResponse + Send + Sync + 'static,
+    {
+        Self { inner: FsCallbackKind::Sync(Box::new(callback)) }
+    }
+
+    /// Wrap an async closure that returns a `Future<Output = FsResponse>`.
+    /// The future is spawned on `runtime`; on completion it delivers via
+    /// the per-request sink. mbgl receives a cancellable handle — when
+    /// it drops the handle, the response is discarded (the future itself
+    /// runs to completion).
+    #[cfg(feature = "async")]
+    pub fn new_async<F, Fut>(runtime: tokio::runtime::Handle, callback: F) -> Self
+    where
+        F: Fn(String, ResourceKind) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FsResponse> + Send + 'static,
+    {
+        let cb: AsyncFn = Box::new(move |url, kind| Box::pin(callback(url, kind)));
+        Self { inner: FsCallbackKind::Async { callback: cb, runtime } }
+    }
+}
+
+fn ffi_response(r: FsResponse) -> crate::renderer::bridge::file_source::RustFsResponse {
     use crate::renderer::bridge::file_source::RustFsResponse;
-    #[cfg(feature = "log")]
-    log::debug!("rust-fs request kind={kind:?} url={url}");
-    match (callback.0)(url, kind) {
+    match r {
         FsResponse::Ok(bytes) => RustFsResponse {
             data: bytes,
-            error_reason: FsErrorReason::Success,
+            error_reason: 0,
             error_message: String::new(),
             no_content: false,
         },
         FsResponse::NoContent => RustFsResponse {
             data: Vec::new(),
-            error_reason: FsErrorReason::Success,
+            error_reason: 0,
             error_message: String::new(),
             no_content: true,
         },
         FsResponse::Error { reason, message } => RustFsResponse {
             data: Vec::new(),
-            error_reason: reason,
+            error_reason: reason as u8,
             error_message: message,
             no_content: false,
         },
     }
+}
+
+/// Register a [`FileSourceRequestCallback`] as the process-global
+/// `ResourceLoader` factory without going through the builder. Useful
+/// for installing a callback ahead of [`SingleThreadedRenderPool`](crate::SingleThreadedRenderPool),
+/// whose worker thread builds its renderer lazily.
+///
+/// See [`ImageRendererBuilder::with_file_source_callback`](crate::ImageRendererBuilder::with_file_source_callback)
+/// for the singleton/threading caveats — they apply here too.
+pub fn register_file_source_callback(callback: FileSourceRequestCallback) {
+    crate::renderer::bridge::file_source::register_rust_file_source_factory(Box::new(callback));
+}
+
+/// Bridge predicate invoked by C++ (under `MLN_ASYNC_FILE_SOURCE`) to pick
+/// sync vs async dispatch. The body is correct in both feature configs:
+/// without the `async` feature, `FsCallbackKind::Async` does not exist, so
+/// the matches! always returns true.
+pub(crate) fn fs_callback_is_sync(callback: &FileSourceRequestCallback) -> bool {
+    matches!(&callback.inner, FsCallbackKind::Sync(_))
+}
+
+/// Bridge sync-dispatch entry point. Invoked by C++ inside
+/// `RustFileSource::request`.
+pub(crate) fn fs_invoke_sync(
+    callback: &FileSourceRequestCallback,
+    url: &str,
+    kind: u8,
+) -> crate::renderer::bridge::file_source::RustFsResponse {
+    let kind = ResourceKind::from_u8(kind);
+    #[cfg(feature = "log")]
+    log::debug!("rust-fs request kind={kind:?} url={url}");
+    match &callback.inner {
+        FsCallbackKind::Sync(f) => ffi_response(f(url, kind)),
+        #[cfg(feature = "async")]
+        FsCallbackKind::Async { .. } => {
+            unreachable!("fs_invoke_sync called on async callback");
+        }
+    }
+}
+
+/// Bridge async-dispatch entry point. Spawns the closure's future on the
+/// configured tokio runtime; the spawned task takes ownership of the
+/// `FsRequestSink` and calls its `deliver` method when the future resolves.
+///
+/// The C++ call site is gated by `#ifdef MLN_ASYNC_FILE_SOURCE` (set by
+/// `build.rs` when the cargo `async` feature is enabled). On sync-only
+/// builds the body is empty — the function exists so the cxx bridge has
+/// something to link against, but C++ never reaches it.
+#[cfg(feature = "async")]
+pub(crate) fn fs_invoke_async(
+    callback: &FileSourceRequestCallback,
+    url: String,
+    kind: u8,
+    sink: cxx::UniquePtr<crate::renderer::bridge::file_source::FsRequestSink>,
+) {
+    let FsCallbackKind::Async { callback: cb, runtime } = &callback.inner else {
+        unreachable!("fs_invoke_async called on sync callback");
+    };
+    let kind = ResourceKind::from_u8(kind);
+    #[cfg(feature = "log")]
+    log::debug!("rust-fs request kind={kind:?} url={url}");
+    let fut = cb(url, kind);
+    runtime.spawn(async move {
+        let response = fut.await;
+        let mut sink = sink;
+        sink.pin_mut().deliver(ffi_response(response));
+    });
+}
+
+#[cfg(not(feature = "async"))]
+pub(crate) fn fs_invoke_async(
+    _callback: &FileSourceRequestCallback,
+    _url: String,
+    _kind: u8,
+    _sink: cxx::UniquePtr<crate::renderer::bridge::file_source::FsRequestSink>,
+) {
 }
